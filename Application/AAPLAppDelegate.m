@@ -2,7 +2,7 @@
 See LICENSE folder for this sample’s licensing information.
 
 Abstract:
-Implementation of the application delegate
+The implementation of the app delegate.
 */
 
 #import "AAPLAppDelegate.h"
@@ -12,20 +12,20 @@ Implementation of the application delegate
 @end
 
 @implementation AAPLAppDelegate
+#if TARGET_IOS
 
-- (void)applicationDidFinishLaunching:(NSNotification *)aNotification
+- (BOOL)application:(UIApplication *)application didFinishLaunchingWithOptions:(NSDictionary *)launchOptions
 {
-
+    // The override point for customization after app launch.
+    return YES;
 }
 
-- (void)applicationWillTerminate:(NSNotification *)aNotification
-{
+#else
 
-}
-
-- (BOOL)applicationShouldTerminateAfterLastWindowClosed:(NSApplication *)sender
+- (BOOL) applicationShouldTerminateAfterLastWindowClosed:(NSApplication*) sender
 {
     return YES;
 }
 
+#endif
 @end

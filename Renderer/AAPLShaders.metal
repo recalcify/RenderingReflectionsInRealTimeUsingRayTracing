@@ -2,19 +2,21 @@
 See LICENSE folder for this sample’s licensing information.
 
 Abstract:
-Metal shaders and kernels
+The Metal shaders and kernels.
 */
 
 #include <metal_stdlib>
 #include <simd/simd.h>
 
-// Including header shared between this Metal shader code and Swift/C code executing Metal API commands
+// Include the header that this Metal shader code shares with the Swift/C code that executes Metal API commands.
 #include "AAPLShaderTypes.h"
+
 #include "AAPLArgumentBufferTypes.h"
 
 using namespace metal;
 
 constant float PI = 3.1415926535897932384626433832795;
+constant float kMaxHDRValue = 500.0f;
 
 typedef struct
 {
@@ -49,13 +51,15 @@ struct LightingParameters
     float   ambientOcclusion;
 };
 
-constexpr sampler linearSampler (mip_filter::linear,
+constexpr sampler linearSampler (address::repeat,
+                                 mip_filter::linear,
                                  mag_filter::linear,
                                  min_filter::linear);
 
-constexpr sampler nearestSampler(min_filter::nearest, mag_filter::nearest, mip_filter::none);
-
-constexpr sampler mipSampler(address::clamp_to_edge, min_filter::linear, mag_filter::linear, mip_filter::linear);
+constexpr sampler nearestSampler(address::repeat,
+                                 min_filter::nearest,
+                                 mag_filter::nearest,
+                                 mip_filter::none);
 
 inline float Fresnel(float dotProduct);
 inline float sqr(float a);
@@ -82,7 +86,6 @@ float Geometry(float Ndotv, float alphaG) {
 float3 computeNormalMap(ColorInOut in, texture2d<float> normalMapTexture) {
     float4 encodedNormal = normalMapTexture.sample(nearestSampler, float2(in.texCoord));
     float4 normalMap = float4(normalize(encodedNormal.xyz * 2.0 - float3(1,1,1)), 0.0);
-
     return float3(normalize(in.normal * normalMap.z + in.tangent * normalMap.x + in.bitangent * normalMap.y));
 }
 
@@ -120,15 +123,25 @@ float3 computeSpecular(LightingParameters parameters)
     return specularOutput * parameters.ambientOcclusion;
 }
 
+// The helper for the equirectangular textures.
+float4 equirectangularSample(float3 direction, sampler s, texture2d<float> image)
+{
+    float3 d = normalize(direction);
+
+    float2 t = float2((atan2(d.z, d.x) + M_PI_F) / (2.f * M_PI_F), acos(d.y) / M_PI_F);
+
+    return image.sample(s, t);
+}
+
 LightingParameters calculateParameters(ColorInOut in,
-                                       constant AAPLCameraData& cameraData,
+                                       AAPLCameraData cameraData,
                                        constant AAPLLightData& lightData,
                                        texture2d<float>   baseColorMap,
                                        texture2d<float>   normalMap,
                                        texture2d<float>   metallicMap,
                                        texture2d<float>   roughnessMap,
                                        texture2d<float>   ambientOcclusionMap,
-                                       texturecube<float> irradianceMap)
+                                       texture2d<float>   skydomeMap)
 {
     LightingParameters parameters;
 
@@ -145,8 +158,10 @@ LightingParameters calculateParameters(ColorInOut in,
     parameters.ambientOcclusion = ambientOcclusionMap.sample(linearSampler, in.texCoord.xy).x;
 
     parameters.reflectedVector = reflect(-parameters.viewDir, parameters.normal);
-    uint8_t mipLevel = parameters.roughness * irradianceMap.get_num_mip_levels();
-    parameters.irradiatedColor = irradianceMap.sample(mipSampler, parameters.reflectedVector, level(mipLevel)).xyz;
+    
+    constexpr sampler linearFilterSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+    float3 c = equirectangularSample(parameters.reflectedVector, linearFilterSampler, skydomeMap).rgb;
+    parameters.irradiatedColor = clamp(c, 0.f, kMaxHDRValue);
 
     parameters.lightDir = lightData.directionalLightInvDirection;
     parameters.nDotl = max(0.001f,saturate(dot(parameters.normal, parameters.lightDir)));
@@ -186,12 +201,11 @@ vertex SkyboxV2F skyboxVertex(SkyboxVertex in [[stage_in]],
     return v;
 }
 
-fragment float4 skyboxFragment(SkyboxV2F v [[stage_in]])
+fragment float4 skyboxFragment(SkyboxV2F v [[stage_in]], texture2d<float> skytexture [[texture(0)]])
 {
-    float3 bottomColor = float3( 0.154, 0.154, 0.154 );
-    float3 topColor = float3(0.40, 0.46, 0.78);
-    float y = saturate( v.y * 0.5 + 0.5 );
-    return float4( mix(bottomColor, topColor, y), 1.0f );
+    constexpr sampler linearFilterSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+    float3 c = equirectangularSample(v.cameraToPointV.xyz/v.cameraToPointV.w, linearFilterSampler, skytexture).rgb;
+    return float4(clamp(c, 0.f, kMaxHDRValue), 1.f);
 }
 
 #pragma mark - Rasterization
@@ -215,9 +229,8 @@ vertex ColorInOut vertexShader(Vertex in [[stage_in]],
     out.position = cameraData.projectionMatrix * cameraData.viewMatrix * instanceTransform.modelViewMatrix * position;
     out.ndcpos = out.position.xyz/out.position.w;
 
-    // Reflections and lighting to be done in world space therefore camera.viewMatrix not
-    // taken into consideration here.
-
+    // Reflections and lighting that occur in the world space, so
+    // `camera.viewMatrix` isn’t taken into consideration here.
     float4x4 objToWorld = instanceTransform.modelViewMatrix;
     out.worldPosition = (objToWorld * position).xyz;
 
@@ -243,18 +256,15 @@ float2 calculateScreenCoord( float3 ndcpos )
     return screenTexcoord;
 }
 
-constant bool is_raytracing_enabled [[function_constant(100)]];
+constant bool is_raytracing_enabled [[function_constant(AAPLConstantIndexRayTracingEnabled)]];
 
 fragment float4 fragmentShader(
                     ColorInOut                  in                    [[stage_in]],
                     constant AAPLCameraData&    cameraData            [[ buffer(BufferIndexCameraData) ]],
                     constant AAPLLightData&     lightData             [[ buffer(BufferIndexLightData) ]],
-                    texture2d<float>            colorMap              [[ texture(AAPLTextureIndexBaseColor) ]],
-                    texture2d<float>            normalMap             [[ texture(AAPLTextureIndexNormal) ]],
-                    texture2d<float>            metallicMap           [[ texture(AAPLTextureIndexMetallic) ]],
-                    texture2d<float>            roughnessMap          [[ texture(AAPLTextureIndexRoughness) ]],
-                    texture2d<float>            ambientOcclusionMap   [[ texture(AAPLTextureIndexAmbientOcclusion) ]],
-                    texturecube<float>          irradianceMap         [[ texture(AAPLTextureIndexIrradianceMap) ]],
+                    constant AAPLSubmeshKeypath&submeshKeypath        [[ buffer(BufferIndexSubmeshKeypath)]],
+                    constant Scene*             pScene                [[ buffer(SceneIndex)]],
+                    texture2d<float>            skydomeMap            [[ texture(AAPLSkyDomeTexture) ]],
                     texture2d<float>            rtReflections         [[ texture(AAPLTextureIndexReflections), function_constant(is_raytracing_enabled)]])
 {
     constexpr sampler colorSampler(mip_filter::linear,
@@ -262,10 +272,23 @@ fragment float4 fragmentShader(
                                    min_filter::linear);
 
     float2 screenTexcoord = calculateScreenCoord( in.ndcpos );
+    
+    constant Mesh* pMesh = &(pScene->meshes[ pScene->instances[submeshKeypath.instanceID].meshIndex ]);
+    constant Submesh* pSubmesh = &(pMesh->submeshes[submeshKeypath.submeshID]);
 
-    LightingParameters params = calculateParameters(in, cameraData, lightData, colorMap, normalMap, metallicMap, roughnessMap, ambientOcclusionMap, irradianceMap);
+    LightingParameters params = calculateParameters(in,
+                                                    cameraData,
+                                                    lightData,
+                                                    pSubmesh->materials[AAPLTextureIndexBaseColor],        //colorMap
+                                                    pSubmesh->materials[AAPLTextureIndexNormal],           //normalMap
+                                                    pSubmesh->materials[AAPLTextureIndexMetallic],         //metallicMap
+                                                    pSubmesh->materials[AAPLTextureIndexRoughness],        //roughnessMap
+                                                    pSubmesh->materials[AAPLTextureIndexAmbientOcclusion], //ambientOcclusionMap
+                                                    skydomeMap);
 
     float li = lightData.lightIntensity;
+    params.roughness += cameraData.roughnessBias;
+    clamp( params.roughness, 0.f, 0.8f );
 
     if ( is_raytracing_enabled )
     {
@@ -276,7 +299,7 @@ fragment float4 fragmentShader(
         params.irradiatedColor = mix(params.irradiatedColor, reflectedColor.rgb, hasReflection);
 
     }
-
+    params.metalness += cameraData.metallicBias;
     float4 final_color = float4(computeSpecular(params) + li * computeDiffuse(params), 1.0f);
     return final_color;
 }
@@ -308,14 +331,14 @@ fragment ThinGBufferOut gBufferFragmentShader(ColorInOut in [[stage_in]])
 
 #if __METAL_VERSION__ >= 230
 
-#pragma mark - Raytracing
+#pragma mark - Ray tracing
 using raytracing::instance_acceleration_structure;
 
 kernel void rtReflection(
              texture2d< float, access::write >      outImage                [[texture(OutImageIndex)]],
-             texture2d< float, access::read >       positions               [[texture(ThinGBufferPositionIndex)]],
-             texture2d< float, access::read >       directions              [[texture(ThinGBufferDirectionIndex)]],
-             texturecube< float, access::sample >   irradianceMap           [[texture(IrradianceMapIndex)]],
+             texture2d< float >                     positions               [[texture(ThinGBufferPositionIndex)]],
+             texture2d< float >                     directions              [[texture(ThinGBufferDirectionIndex)]],
+             texture2d< float >                     skydomeMap              [[texture(AAPLSkyDomeTexture)]],
              constant AAPLInstanceTransform*        instanceTransforms      [[buffer(BufferIndexInstanceTransforms)]],
              constant AAPLCameraData&               cameraData              [[buffer(BufferIndexCameraData)]],
              constant AAPLLightData&                lightData               [[buffer(BufferIndexLightData)]],
@@ -337,8 +360,8 @@ kernel void rtReflection(
         {
             raytracing::ray r;
             r.origin = positions.read(tid).xyz;
-            r.direction = directions.read(tid).xyz;
-            r.min_distance = 0.01;
+            r.direction = normalize(directions.read(tid).xyz);
+            r.min_distance = 0.1;
             r.max_distance = FLT_MAX;
 
             raytracing::intersector<raytracing::instancing, raytracing::triangle_data> inter;
@@ -350,13 +373,27 @@ kernel void rtReflection(
                 float3 bary3 = float3( 1.0 - (bary2.x + bary2.y), bary2.x, bary2.y );
 
                 constant Instance& instance = pScene->instances[ intersection.instance_id ];
-                constant Mesh* pMesh = instance.pMesh;
+                constant Mesh* pMesh = &(pScene->meshes[instance.meshIndex]);
                 constant Submesh & submesh = pMesh->submeshes[ intersection.geometry_id ];
-                uint32_t i0 = submesh.indices[ intersection.primitive_id * 3 + 0];
-                uint32_t i1 = submesh.indices[ intersection.primitive_id * 3 + 1];
-                uint32_t i2 = submesh.indices[ intersection.primitive_id * 3 + 2];
+                
+                uint32_t i0, i1, i2;
+                
+                if ( submesh.shortIndexType )
+                {
+                    constant uint16_t* pIndices = (constant uint16_t *)submesh.indices;
+                    i0 = pIndices[ intersection.primitive_id * 3 + 0];
+                    i1 = pIndices[ intersection.primitive_id * 3 + 1];
+                    i2 = pIndices[ intersection.primitive_id * 3 + 2];
+                }
+                else
+                {
+                    constant uint32_t* pIndices = (constant uint32_t *)submesh.indices;
+                    i0 = pIndices[ intersection.primitive_id * 3 + 0];
+                    i1 = pIndices[ intersection.primitive_id * 3 + 1];
+                    i2 = pIndices[ intersection.primitive_id * 3 + 2];
+                }
 
-                float4x4 mv = instanceTransforms[intersection.instance_id].modelViewMatrix;
+                float4x4 mv = instance.transform;
                 half3x3 normalMx = half3x3(half3(mv.columns[0].xyz), half3(mv.columns[1].xyz), half3(mv.columns[2].xyz));
 
                 // Normal
@@ -366,13 +403,13 @@ kernel void rtReflection(
                 half3 n2 = pMesh->generics[i2].normal.xyz;
 
                 half3 n = (n0 * bary3.x) + (n1 * bary3.y) + (n2 * bary3.z);
-                n = normalMx * n;
+                n = normalize(normalMx * n);
 
                 // Texcoords
 
-                float2 tc0 = pMesh->generics[i0].tc.xy;
-                float2 tc1 = pMesh->generics[i1].tc.xy;
-                float2 tc2 = pMesh->generics[i2].tc.xy;
+                float2 tc0 = pMesh->generics[i0].texcoord.xy;
+                float2 tc1 = pMesh->generics[i1].texcoord.xy;
+                float2 tc2 = pMesh->generics[i2].texcoord.xy;
 
                 float2 texcoord = (tc0 * bary3.x) + (tc1 * bary3.y) + (tc2 * bary3.z);
 
@@ -402,13 +439,8 @@ kernel void rtReflection(
 
                 packed_float3 worldPosition = (wp0 * bary3.x) + (wp1 * bary3.y) + (wp2 * bary3.z);
 
-                /*
-                texture2d< float, access::sample > colorMap = submesh.materials[0].textureMap;
-                constexpr sampler s(mip_filter::linear, mag_filter::linear, min_filter::linear);
-
-                float4 texel = colorMap.sample( s, texcoord );
-                finalColor = texel; // break here for no lighting
-                */
+                // Prepare structures for shading:
+                
                 ColorInOut colorIn = {};
                 colorIn.worldPosition = worldPosition;
                 colorIn.normal = float3(n);
@@ -416,19 +448,119 @@ kernel void rtReflection(
                 colorIn.bitangent = float3(bitangent);
                 colorIn.texCoord = texcoord;
 
-                texture2d< float > baseColorMap = submesh.materials[0].textureMap;
-                texture2d< float > normalMap = submesh.materials[1].textureMap;
-                texture2d< float > metallicMap = submesh.materials[2].textureMap;
-                texture2d< float > roughnessMap = submesh.materials[3].textureMap;
-                texture2d< float > ambientOcclusionMap = submesh.materials[4].textureMap;
+                texture2d< float > baseColorMap        = submesh.materials[AAPLTextureIndexBaseColor];        //colorMap
+                texture2d< float > normalMap           = submesh.materials[AAPLTextureIndexNormal];           //normalMap
+                texture2d< float > metallicMap         = submesh.materials[AAPLTextureIndexMetallic];         //metallicMap
+                texture2d< float > roughnessMap        = submesh.materials[AAPLTextureIndexRoughness];        //roughnessMap
+                texture2d< float > ambientOcclusionMap = submesh.materials[AAPLTextureIndexAmbientOcclusion]; //ambientOcclusionMap
 
-                LightingParameters params = calculateParameters( colorIn, cameraData, lightData, baseColorMap, normalMap, metallicMap, roughnessMap, ambientOcclusionMap, irradianceMap );
+                // For shading, adjust the camera position and the world position to
+                // correctly account for reflections in reflections (noticeable on the
+                // sphere's reflection environment map). This is because to correctly
+                // sample the environment map, the shader needs to take into account that
+                // the ray starts from the thin G-Buffer, not from the camera.
+                AAPLCameraData cd( cameraData );
+                cd.cameraPosition = r.origin;
+                colorIn.worldPosition = r.origin + r.direction * intersection.distance;
+                
+                LightingParameters params = calculateParameters(colorIn,
+                                                                cd,
+                                                                lightData,
+                                                                baseColorMap,
+                                                                normalMap,
+                                                                metallicMap,
+                                                                roughnessMap,
+                                                                ambientOcclusionMap,
+                                                                skydomeMap);
+                
                 finalColor = float4( computeSpecular( params ) + lightData.lightIntensity * computeDiffuse( params ), 1.0 );
                 finalColor.rgb *= lightData.lightIntensity;
 
+            }
+            else if ( intersection.type == raytracing::intersection_type::none )
+            {
+                constexpr sampler linearFilterSampler(coord::normalized, address::clamp_to_edge, filter::linear);
+                float3 c = equirectangularSample( r.direction, linearFilterSampler, skydomeMap ).rgb;
+                finalColor = float4( clamp( c, 0.0f, kMaxHDRValue ), 1.0f);
             }
         }
         outImage.write( finalColor, tid );
     }
 }
+
+struct VertexInOut
+{
+    float4 position [[position]];
+    float2 uv;
+};
+
+constant float4 s_quad[] = {
+    float4( -1.0f, +1.0f, 0.0f, 1.0f ),
+    float4( -1.0f, -1.0f, 0.0f, 1.0f ),
+    float4( +1.0f, -1.0f, 0.0f, 1.0f ),
+    float4( +1.0f, -1.0f, 0.0f, 1.0f ),
+    float4( +1.0f, +1.0f, 0.0f, 1.0f ),
+    float4( -1.0f, +1.0f, 0.0f, 1.0f )
+};
+
+constant float2 s_quadtc[] = {
+    float2( 0.0f, 0.0f ),
+    float2( 0.0f, 1.0f ),
+    float2( 1.0f, 1.0f ),
+    float2( 1.0f, 1.0f ),
+    float2( 1.0f, 0.0f ),
+    float2( 0.0f, 0.0f )
+};
+
+vertex VertexInOut vertexPassthrough( uint vid [[vertex_id]] )
+{
+    VertexInOut o;
+    o.position = s_quad[vid];
+    o.uv = s_quadtc[vid];
+    return o;
+}
+
+fragment float4 fragmentPassthrough( VertexInOut in [[stage_in]], texture2d< float > tin )
+{
+    constexpr sampler s( address::repeat, min_filter::linear, mag_filter::linear );
+    return tin.sample( s, in.uv );
+}
+
+fragment float4 fragmentBloomThreshold( VertexInOut in [[stage_in]],
+                                       texture2d< float > tin [[texture(0)]],
+                                       constant float* threshold [[buffer(0)]] )
+{
+    constexpr sampler s( address::repeat, min_filter::linear, mag_filter::linear );
+    float4 c = tin.sample( s, in.uv );
+    if ( dot( c.rgb, float3( 0.299f, 0.587f, 0.144f ) ) > (*threshold) )
+    {
+        return c;
+    }
+    return float4(0.f, 0.f, 0.f, 1.f );
+}
+
+// The standard ACES tonemap function from "Modern Rendering" sample.
+static float3 ToneMapACES(float3 x)
+{
+    float a = 2.51f;
+    float b = 0.03f;
+    float c = 2.43f;
+    float d = 0.59f;
+    float e = 0.14f;
+    return saturate((x*(a*x+b))/(x*(c*x+d)+e));
+}
+
+fragment float4 fragmentPostprocessMerge( VertexInOut in [[stage_in]],
+                                         constant float& exposure [[buffer(0)]],
+                                         texture2d< float > texture0 [[texture(0)]],
+                                         texture2d< float > texture1 [[texture(1)]])
+{
+    constexpr sampler s( address::repeat, min_filter::linear, mag_filter::linear );
+    float4 t0 = texture0.sample( s, in.uv );
+    float4 t1 = texture1.sample( s, in.uv );
+    float3 c = t0.rgb + t1.rgb;
+    c = ToneMapACES( c * exposure );
+    return float4( c, 1.0f );
+}
+
 #endif

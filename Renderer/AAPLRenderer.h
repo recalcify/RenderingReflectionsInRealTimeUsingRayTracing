@@ -2,7 +2,7 @@
 See LICENSE folder for this sample’s licensing information.
 
 Abstract:
-Header for renderer class which performs Metal setup and per frame rendering
+The header for the renderer class that performs Metal setup and per-frame rendering.
 */
 
 #import <MetalKit/MetalKit.h>
@@ -14,13 +14,15 @@ typedef NS_ENUM( uint8_t, RenderMode )
     RMReflectionsOnly = 2
 };
 
-// Platform independent renderer class.   Implements the MTKViewDelegate protocol which
+// The platform-independent renderer class. Implements the MTKViewDelegate protocol, which
 //   allows it to accept per-frame update and drawable resize callbacks.
 @interface AAPLRenderer : NSObject <MTKViewDelegate>
 
-- (nonnull instancetype)initWithMetalKitView:(nonnull MTKView *)view;
+- (nonnull instancetype)initWithMetalKitView:(nonnull MTKView *)view size:(CGSize)size;
 - (void)setRenderMode:(RenderMode)renderMode;
 - (void)setCameraPanSpeedFactor:(float)speedFactor;
-
+- (void)setMetallicBias:(float)metallicBias;
+- (void)setRoughnessBias:(float)roughnessBias;
+- (void)setExposure:(float)exposure;
 @end
 

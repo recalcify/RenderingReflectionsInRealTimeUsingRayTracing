@@ -2,12 +2,17 @@
 See LICENSE folder for this sample’s licensing information.
 
 Abstract:
-Header containing types and enum constants shared between Metal shaders and C/ObjC source
+The header that contains types and enumerated constants that the Metal shaders and the C/ObjC source share.
 */
 #ifndef AAPLShaderTypes_h
 #define AAPLShaderTypes_h
 
 #include <simd/simd.h>
+
+typedef enum AAPLConstantIndex
+{
+    AAPLConstantIndexRayTracingEnabled
+} AAPLConstantIndex;
 
 typedef enum RTReflectionKernelImageIndex
 {
@@ -29,7 +34,8 @@ typedef enum BufferIndex
     BufferIndexMeshGenerics         = 1,
     BufferIndexInstanceTransforms   = 2,
     BufferIndexCameraData           = 3,
-    BufferIndexLightData            = 4
+    BufferIndexLightData            = 4,
+    BufferIndexSubmeshKeypath       = 5
 } BufferIndex;
 
 typedef enum VertexAttribute
@@ -38,8 +44,8 @@ typedef enum VertexAttribute
     VertexAttributeTexcoord  = 1,
 } VertexAttribute;
 
-// Attribute index values shared between shader and C code to ensure Metal shader vertex
-//   attribute indices match the Metal API vertex descriptor attribute indices
+// The attribute index values that the shader and the C code share to ensure Metal
+// shader vertex attribute indices match the Metal API vertex descriptor attribute indices.
 typedef enum AAPLVertexAttribute
 {
     AAPLVertexAttributePosition  = 0,
@@ -49,8 +55,8 @@ typedef enum AAPLVertexAttribute
     AAPLVertexAttributeBitangent = 4
 } AAPLVertexAttribute;
 
-// Texture index values shared between shader and C code to ensure Metal shader texture indices
-//   match indices of Metal API texture set calls
+// The texture index values that the shader and the C code share to ensure
+// Metal shader texture indices match indices of Metal API texture set calls.
 typedef enum AAPLTextureIndex
 {
     AAPLTextureIndexBaseColor        = 0,
@@ -60,11 +66,12 @@ typedef enum AAPLTextureIndex
     AAPLTextureIndexAmbientOcclusion = 4,
     AAPLTextureIndexIrradianceMap    = 5,
     AAPLTextureIndexReflections      = 6,
-    AAPLNumMeshTextureIndices = AAPLTextureIndexAmbientOcclusion+1,
+    AAPLSkyDomeTexture               = 7,
+    AAPLMaterialTextureCount = AAPLTextureIndexAmbientOcclusion+1,
 } AAPLTextureIndex;
 
-// Buffer index values shared between shader and C code to ensure Metal shader buffer inputs match
-//   Metal API buffer set calls
+// The buffer index values that the shader and the C code share to
+// ensure Metal shader buffer inputs match Metal API buffer set calls.
 typedef enum AAPLBufferIndex
 {
     AAPLBufferIndexMeshPositions    = 0,
@@ -81,10 +88,12 @@ typedef struct AAPLCameraData
     matrix_float4x4 projectionMatrix;
     matrix_float4x4 viewMatrix;
     vector_float3 cameraPosition;
+    float metallicBias;
+    float roughnessBias;
 } AAPLCameraData;
 
-// Structure shared between shader and C code to ensure the layout of data accessed in
-//    Metal shaders matches the layout of data set in C code
+// The structure that the shader and the C code share to ensure the layout of
+// data accessed in Metal shaders matches the layout of data set in C code.
 typedef struct
 {
     // Per Light Properties
@@ -92,6 +101,12 @@ typedef struct
     float lightIntensity;
 
 } AAPLLightData;
+
+typedef struct AAPLSubmeshKeypath
+{
+    uint32_t instanceID;
+    uint32_t submeshID;
+} AAPLSubmeshKeypath;
 
 #endif /* ShaderTypes_h */
 

@@ -2,13 +2,24 @@
 See LICENSE folder for this sample’s licensing information.
 
 Abstract:
-Header for the application delegate
+The header for the app delegate.
 */
+#if TARGET_IOS
+
+#import <UIKit/UIKit.h>
+
+@interface AAPLAppDelegate : UIResponder <UIApplicationDelegate>
+
+@property (strong, nonatomic) UIWindow *window;
+
+@end
+
+#else
 
 #import <Cocoa/Cocoa.h>
 
 @interface AAPLAppDelegate : NSObject <NSApplicationDelegate>
 
-@property (assign) IBOutlet NSWindow *window;
-
 @end
+
+#endif
