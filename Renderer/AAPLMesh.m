@@ -1,5 +1,5 @@
 /*
-See LICENSE folder for this sample’s licensing information.
+See the LICENSE.txt file for this sample’s licensing information.
 
 Abstract:
 The implementation for the mesh and submesh objects.
@@ -638,7 +638,8 @@ id<MTLTexture> texture_from_radiance_file(NSString * fileName, id<MTLDevice> dev
 
     size_t bpp = CGImageGetBitsPerPixel(loadedImage);
 
-    const size_t kSrcChannelCount = 3;
+    CGImageAlphaInfo alphaInfo = CGImageGetAlphaInfo(loadedImage);
+    const size_t kSrcChannelCount = (kCGImageAlphaNone == alphaInfo) ? 3 : 4;
     const size_t kBitsPerByte = 8;
     const size_t kExpectedBitsPerPixel = sizeof(uint16_t) * kSrcChannelCount * kBitsPerByte;
 
@@ -665,23 +666,28 @@ id<MTLTexture> texture_from_radiance_file(NSString * fileName, id<MTLDevice> dev
     // Get a pointer to the data.
     const uint16_t * srcData = (const uint16_t * )CFDataGetBytePtr(cgImageData);
 
-    // Metal exposes an RGBA16Float format, but the source data is RGB F16, so
-    // this function adds an extra channel of padding.
-    const size_t kPixelCount = width * height;
+    uint16_t * paddedData = nil;
     const size_t kDstChannelCount = 4;
-    const size_t kDstSize = kPixelCount * sizeof(uint16_t) * kDstChannelCount;
 
-    uint16_t * dstData = (uint16_t *)malloc(kDstSize);
-
-    for (size_t texIdx = 0; texIdx < kPixelCount; ++texIdx)
+    if (3 == kSrcChannelCount)
     {
-        const uint16_t * currSrc = srcData + (texIdx * kSrcChannelCount);
-        uint16_t * currDst = dstData + (texIdx * kDstChannelCount);
-
-        currDst[0] = currSrc[0];
-        currDst[1] = currSrc[1];
-        currDst[2] = currSrc[2];
-        currDst[3] = float16_from_float32(1.f);
+        // Pads the data with an extra channel (byte) because the source data is RGB16F,
+        // but Metal exposes it as an RGBA16Float format.
+        const size_t kPixelCount = width * height;
+        const size_t kDstSize = kPixelCount * sizeof(uint16_t) * kDstChannelCount;
+        
+        paddedData = (uint16_t *)malloc(kDstSize);
+        
+        for (size_t texIdx = 0; texIdx < kPixelCount; ++texIdx)
+        {
+            const uint16_t * currSrc = srcData + (texIdx * kSrcChannelCount);
+            uint16_t * currDst = paddedData + (texIdx * kDstChannelCount);
+            
+            currDst[0] = currSrc[0];
+            currDst[1] = currSrc[1];
+            currDst[2] = currSrc[2];
+            currDst[3] = float16_from_float32(1.f);
+        }
     }
 
     // Create an `MTLTexture`.
@@ -698,10 +704,11 @@ id<MTLTexture> texture_from_radiance_file(NSString * fileName, id<MTLDevice> dev
 
     MTLRegion region = { {0,0,0}, {width, height, 1} };
 
-    [texture replaceRegion:region mipmapLevel:0 withBytes:dstData bytesPerRow:kBytesPerRow];
+    [texture replaceRegion:region mipmapLevel:0 withBytes:paddedData ? paddedData : srcData bytesPerRow:kBytesPerRow];
 
     // Remember to clean things up.
-    free(dstData);
+    if (paddedData)
+        free(paddedData);
     CFRelease(cgImageData);
     CFRelease(loadedImage);
 

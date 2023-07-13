@@ -1,5 +1,5 @@
 /*
-See LICENSE folder for this sample’s licensing information.
+See the LICENSE.txt file for this sample’s licensing information.
 
 Abstract:
 The math utility functions that create and modify vectors, matrices, quaternions,
@@ -402,7 +402,7 @@ quaternion_float AAPL_SIMD_OVERLOAD quaternion(vector_float3 v, float w) {
     return (quaternion_float){ v.x, v.y, v.z, w };
 }
 
-quaternion_float AAPL_SIMD_OVERLOAD quaternion_identity() {
+quaternion_float AAPL_SIMD_OVERLOAD quaternion_identity(void) {
     return quaternion(0, 0, 0, 1);
 }
 
