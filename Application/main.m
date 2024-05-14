@@ -19,7 +19,7 @@ The app's entry point.
 int main(int argc, char * argv[]) {
 
 #if TARGET_OS_SIMULATOR
-#error Ths sample does not support the iOS Simulator
+#error This sample does not support the iOS Simulator
 #endif
 
     @autoreleasepool {

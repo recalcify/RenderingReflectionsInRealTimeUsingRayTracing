@@ -12,11 +12,21 @@ The implemenation of the renderer class that performs Metal setup and per-frame 
 #import "AAPLRenderer.h"
 
 #import "AAPLMesh.h"
+#import "AAPLModelInstance.h"
 
-// Include the headers that share types between the C code here, which executes
-// Metal API commands, and the .metal files, which use the types as inputs to the shaders.
+/// Include the headers that share types between the C code here, which executes
+/// Metal API commands, and the .metal files, which use the types as inputs to the shaders.
 #import "AAPLShaderTypes.h"
 #import "AAPLArgumentBufferTypes.h"
+
+/// Controls whether to include Metal residency set functionality to the app.
+/// The `MTLResidencySet` APIs require macOS 15 or later, or iOS 18 or later.
+#if (TARGET_MACOS && defined(__MAC_15_0) && (__MAC_OS_X_VERSION_MAX_ALLOWED >= __MAC_15_0)) || \
+    (TARGET_IOS && defined(__IPHONE_18_0) && (__IPHONE_OS_VERSION_MAX_ALLOWED >= __IPHONE_18_0))
+    #define AAPL_SUPPORTS_RESIDENCY_SETS 1
+#else
+    #define AAPL_SUPPORTS_RESIDENCY_SETS 0
+#endif
 
 MTLPackedFloat4x3 matrix4x4_drop_last_row(matrix_float4x4 m)
 {
@@ -30,14 +40,6 @@ MTLPackedFloat4x3 matrix4x4_drop_last_row(matrix_float4x4 m)
 
 static const NSUInteger kMaxBuffersInFlight = 3;
 
-// How to add a new instance:
-// 1. Increase kMaxInstances to include the new instance.
-// 2. Create the mesh in method loadAssets.
-// 3. Modify initializeModelInstances to reference your mesh and set its transform.
-
-// The maximum number of objects in the world (not counting the skybox).37
-static const NSUInteger kMaxInstances = 4;
-
 static const size_t kAlignedInstanceTransformsStructSize = (sizeof(AAPLInstanceTransform) & ~0xFF) + 0x100;
 
 typedef enum AccelerationStructureEvents : uint64_t
@@ -46,18 +48,26 @@ typedef enum AccelerationStructureEvents : uint64_t
     kInstanceAccelerationStructureBuild = 2
 } AccelerationStructureEvents;
 
-typedef struct ModelInstance
-{
-    uint32_t meshIndex;     // The mesh corresponding to this instance.
-    vector_float3 position; // The position of this instance in the world.
-    float rotationRad;      // The Y rotation of this instance in the world.
-} ModelInstance;
-
 typedef struct ThinGBuffer
 {
     id<MTLTexture> positionTexture;
     id<MTLTexture> directionTexture;
 } ThinGBuffer;
+
+/// A helper function that passes an array of instances into batch methods that require pointers and counts.
+void arrayToBatchMethodHelper(NSArray *array, void (^callback)(__unsafe_unretained id *, NSUInteger))
+{
+    static const NSUInteger bufferLength = 16;
+    __unsafe_unretained id buffer[bufferLength];
+    NSFastEnumerationState state = {};
+
+    NSUInteger count;
+
+    while ((count = [array countByEnumeratingWithState:&state objects:buffer count:bufferLength]) > 0)
+    {
+        callback(state.itemsPtr, count);
+    }
+}
 
 @implementation AAPLRenderer
 {
@@ -87,19 +97,17 @@ typedef struct ThinGBuffer
     AAPLMesh* _skybox;
     id<MTLTexture> _skyMap;
 
-    ModelInstance _modelInstances[kMaxInstances];
+    ModelInstance _modelInstances[kMaxModelInstances];
     id<MTLEvent> _accelerationStructureBuildEvent;
     id<MTLAccelerationStructure> _instanceAccelerationStructure;
-    NSArray< id<MTLAccelerationStructure> >* _primitiveAccelerationStructures;
-    id< MTLHeap > _accelerationStructureHeap;
 
     id<MTLTexture> _rtReflectionMap;
     id<MTLFunction> _rtReflectionFunction;
     id<MTLComputePipelineState> _rtReflectionPipeline;
     id<MTLHeap> _rtMipmappingHeap;
     id<MTLRenderPipelineState> _rtMipmapPipeline;
-    
-    // Postprocessing pipelines.
+
+    /// Postprocessing pipelines.
     id<MTLRenderPipelineState> _bloomThresholdPipeline;
     id<MTLRenderPipelineState> _postMergePipeline;
     id<MTLTexture> _rawColorMap;
@@ -108,9 +116,17 @@ typedef struct ThinGBuffer
 
     ThinGBuffer _thinGBuffer;
 
-    // Argument buffers.
-    NSSet< id<MTLResource> >* _sceneResources;
+    /// The argument buffer that contains the resources and constants required for rendering.
     id<MTLBuffer> _sceneArgumentBuffer;
+
+    NSMutableArray<id<MTLResource>>* _sceneResources;
+    NSMutableArray<id<MTLHeap>>* _sceneHeaps;
+
+#if AAPL_SUPPORTS_RESIDENCY_SETS
+    NS_AVAILABLE(15, 18)
+    id<MTLResidencySet> _sceneResidencySet;
+    BOOL _useResidencySet;
+#endif
 
     float _cameraAngle;
     float _cameraPanSpeedFactor;
@@ -123,32 +139,34 @@ typedef struct ThinGBuffer
 - (nonnull instancetype)initWithMetalKitView:(nonnull MTKView *)view size:(CGSize)size
 {
     self = [super init];
-    if(self)
+    if (self)
     {
         _device = view.device;
         _inFlightSemaphore = dispatch_semaphore_create(kMaxBuffersInFlight);
         _accelerationStructureBuildEvent = [_device newEvent];
-        [self initializeModelInstances];
+        configureModelInstances(_modelInstances, kMaxModelInstances);
         _projectionMatrix = [self projectionMatrixWithAspect:size.width / size.height];
+        _sceneResources = [[NSMutableArray alloc] init];
+        _sceneHeaps = [[NSMutableArray alloc] init];
         [self loadMetalWithView:view];
         [self loadAssets];
-        
+
         BOOL createdArgumentBuffers = NO;
-        
+
         char* opts = getenv("DISABLE_METAL3_FEATURES");
-        if ( (opts == NULL) || (strstr(opts, "1") != opts))
+        if ((opts == NULL) || (strstr(opts, "1") != opts))
         {
             if ( @available( macOS 13, iOS 16, *) )
             {
-                if( [_device supportsFamily:MTLGPUFamilyMetal3] )
+                if ( [_device supportsFamily:MTLGPUFamilyMetal3] )
                 {
                     createdArgumentBuffers = YES;
                     [self buildSceneArgumentBufferMetal3];
                 }
             }
         }
-        
-        if ( !createdArgumentBuffers )
+
+        if (!createdArgumentBuffers)
         {
             [self buildSceneArgumentBufferFromReflectionFunction:_rtReflectionFunction];
         }
@@ -156,6 +174,21 @@ typedef struct ThinGBuffer
         // Call this last to ensure everything else builds.
         [self resizeRTReflectionMapTo:view.drawableSize];
         [self buildRTAccelerationStructures];
+
+#if AAPL_SUPPORTS_RESIDENCY_SETS
+        if ((opts == NULL) || (strstr(opts, "1") != opts))
+        {
+            if ( @available( macOS 15, iOS 18, *) )
+            {
+                if ( [_device supportsFamily:MTLGPUFamilyApple6] )
+                {
+                    [self buildSceneResidencySet];
+                    _useResidencySet = YES;
+                }
+            }
+        }
+#endif
+
         _cameraPanSpeedFactor = 0.5f;
         _metallicBias = 0.0f;
         _roughnessBias = 0.0f;
@@ -166,27 +199,6 @@ typedef struct ThinGBuffer
     return self;
 }
 
-- (void)initializeModelInstances
-{
-    NSAssert(kMaxInstances == 4, @"Expected 3 Model Instances");
-
-    _modelInstances[0].meshIndex = 0;
-    _modelInstances[0].position = (vector_float3){20.0f, -5.0f, -40.0f};
-    _modelInstances[0].rotationRad = 135 * M_PI / 180.0f;
-
-    _modelInstances[1].meshIndex = 0;
-    _modelInstances[1].position = (vector_float3){-13.0f, -5.0f, -20.0f};
-    _modelInstances[1].rotationRad = 235 * M_PI / 180.0f;
-    
-    _modelInstances[2].meshIndex = 1;
-    _modelInstances[2].position = (vector_float3){-5.0f, 2.75f, -55.0f};
-    _modelInstances[2].rotationRad = 0.0f;
-    
-    _modelInstances[3].meshIndex = 2;
-    _modelInstances[3].position = (vector_float3){0.0f, -5.0f, -0.0f};
-    _modelInstances[3].rotationRad = 0.0f;
-}
-
 - (void)resizeRTReflectionMapTo:(CGSize)size
 {
     MTLTextureDescriptor* desc = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRG11B10Float
@@ -195,7 +207,7 @@ typedef struct ThinGBuffer
                                                                                 mipmapped:YES];
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageShaderWrite | MTLTextureUsageRenderTarget;
     _rtReflectionMap = [_device newTextureWithDescriptor:desc];
-    
+
     desc.mipmapLevelCount = 1;
     _rawColorMap = [_device newTextureWithDescriptor:desc];
     _bloomThresholdMap = [_device newTextureWithDescriptor:desc];
@@ -203,14 +215,14 @@ typedef struct ThinGBuffer
 
     desc.pixelFormat = MTLPixelFormatRGBA16Float;
     desc.usage = MTLTextureUsageShaderRead | MTLTextureUsageRenderTarget;
+    desc.mipmapLevelCount = 1;
     _thinGBuffer.positionTexture = [_device newTextureWithDescriptor:desc];
     _thinGBuffer.directionTexture = [_device newTextureWithDescriptor:desc];
-    
+
     MTLHeapDescriptor* hd = [[MTLHeapDescriptor alloc] init];
     hd.size = size.width * size.height * 4 * 2 * 3;
     hd.storageMode = MTLStorageModePrivate;
     _rtMipmappingHeap = [_device newHeapWithDescriptor:hd];
-    
 }
 
 #pragma mark - Build Pipeline States
@@ -346,7 +358,7 @@ typedef struct ThinGBuffer
         }
     }
 
-    if(_device.supportsRaytracing)
+    if (_device.supportsRaytracing)
     {
         _rtReflectionFunction = [defaultLibrary newFunctionWithName:@"rtReflection"];
 
@@ -367,17 +379,17 @@ typedef struct ThinGBuffer
         passthroughDesc.vertexFunction = passthroughVert;
         passthroughDesc.fragmentFunction = fragmentFn;
         passthroughDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRG11B10Float;
-        
+
         NSError* __autoreleasing error = nil;
         _rtMipmapPipeline = [_device newRenderPipelineStateWithDescriptor:passthroughDesc error:&error];
         NSAssert( _rtMipmapPipeline, @"Error creating passthrough pipeline: %@", error.localizedDescription );
-        
+
         fragmentFn = [defaultLibrary newFunctionWithName:@"fragmentBloomThreshold"];
         passthroughDesc.fragmentFunction = fragmentFn;
         passthroughDesc.colorAttachments[0].pixelFormat = MTLPixelFormatRG11B10Float;
         _bloomThresholdPipeline = [_device newRenderPipelineStateWithDescriptor:passthroughDesc error:&error];
         NSAssert( _bloomThresholdPipeline, @"Error creating bloom threshold pipeline: %@", error.localizedDescription );
-        
+
         fragmentFn = [defaultLibrary newFunctionWithName:@"fragmentPostprocessMerge"];
         passthroughDesc.fragmentFunction = fragmentFn;
         passthroughDesc.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm_sRGB;
@@ -393,7 +405,7 @@ typedef struct ThinGBuffer
         _depthState = [_device newDepthStencilStateWithDescriptor:depthStateDesc];
     }
 
-    for(int i = 0; i < kMaxBuffersInFlight; i++)
+    for (int i = 0; i < kMaxBuffersInFlight; i++)
     {
         _cameraDataBuffers[i] = [_device newBufferWithLength:sizeof(AAPLCameraData)
                                                  options:MTLResourceStorageModeShared];
@@ -401,11 +413,10 @@ typedef struct ThinGBuffer
         _cameraDataBuffers[i].label = [NSString stringWithFormat:@"CameraDataBuffer %d", i];
     }
 
-    NSUInteger instanceBufferSize = kAlignedInstanceTransformsStructSize * kMaxInstances;
+    NSUInteger instanceBufferSize = kAlignedInstanceTransformsStructSize * kMaxModelInstances;
     _instanceTransformBuffer = [_device newBufferWithLength:instanceBufferSize
                                                     options:MTLResourceStorageModeShared];
     _instanceTransformBuffer.label = @"InstanceTransformBuffer";
-
 
     _lightDataBuffer = [_device newBufferWithLength:sizeof(AAPLLightData) options:MTLResourceStorageModeShared];
     _lightDataBuffer.label = @"LightDataBuffer";
@@ -446,11 +457,11 @@ typedef struct ThinGBuffer
                                                              error:&error]];
 
     [scene addObject:[AAPLMesh newSphereWithRadius:8.0f onDevice:_device vertexDescriptor:modelIOVertexDescriptor]];
-    
+
     [scene addObject:[AAPLMesh newPlaneWithDimensions:(vector_float2){200.0f, 200.0f} onDevice:_device vertexDescriptor:modelIOVertexDescriptor]];
-    
+
     _meshes = scene;
-    
+
     NSAssert(_meshes, @"Could not create meshes from model file %@: %@", modelFileURL.absoluteString, error);
 
     _skyMap = texture_from_radiance_file( @"kloppenheim_06_4k.hdr", _device, &error );
@@ -461,7 +472,6 @@ typedef struct ThinGBuffer
     skyboxModelIOVertexDescriptor.attributes[VertexAttributePosition].name = MDLVertexAttributePosition;
     skyboxModelIOVertexDescriptor.attributes[VertexAttributeTexcoord].name = MDLVertexAttributeTextureCoordinate;
 
-    
     _skybox = [AAPLMesh newSkyboxMeshOnDevice:_device vertexDescriptor:skyboxModelIOVertexDescriptor];
     NSAssert( _skybox, @"Could not create skybox model" );
 }
@@ -492,53 +502,47 @@ typedef struct ThinGBuffer
     // Create argument buffer encoders from the scene argument of the ray-tracing reflection function.
     id<MTLArgumentEncoder> sceneEncoder =
         [function newArgumentEncoderWithBufferIndex:SceneIndex];
-    
+
     id<MTLArgumentEncoder> instanceEncoder =
         [sceneEncoder newArgumentEncoderForBufferAtIndex:AAPLArgmentBufferIDSceneInstances];
-    
+
     id<MTLArgumentEncoder> meshEncoder =
         [sceneEncoder newArgumentEncoderForBufferAtIndex:AAPLArgumentBufferIDSceneMeshes];
-    
+
     id<MTLArgumentEncoder> submeshEncoder =
         [meshEncoder newArgumentEncoderForBufferAtIndex:AAPLArgmentBufferIDMeshSubmeshes];
 
     // The renderer builds this structure to match the ray-traced scene structure so the
     // ray-tracing shader navigates it. In particular, Metal represents each submesh as a
     // geometry in the primitive acceleration structure.
-
-    NSMutableSet< id<MTLResource> >* sceneResources = [NSMutableSet new];
-
-    NSUInteger instanceArgumentSize = instanceEncoder.encodedLength * kMaxInstances;
+    NSUInteger instanceArgumentSize = instanceEncoder.encodedLength * kMaxModelInstances;
     id<MTLBuffer> instanceArgumentBuffer = [self newBufferWithLabel:@"instanceArgumentBuffer"
                                                              length:instanceArgumentSize
-                                                            options:storageMode
-                                                          trackedIn:sceneResources];
-    
+                                                            options:storageMode];
+
     // Encode the instances array in `Scene` (`Scene::instances`).
-    for ( NSUInteger i = 0; i < kMaxInstances; ++i )
+    for ( NSUInteger i = 0; i < kMaxModelInstances; ++i )
     {
         [instanceEncoder setArgumentBuffer:instanceArgumentBuffer offset:i * instanceEncoder.encodedLength];
-        
+
         typedef struct {
             uint32_t meshIndex;
             matrix_float4x4 transform;
         } InstanceData;
-        
+
         InstanceData* pInstanceData = (InstanceData *)[instanceEncoder constantDataAtIndex:0];
         pInstanceData->meshIndex = _modelInstances[i].meshIndex;
         pInstanceData->transform = calculateTransform(_modelInstances[i]);
     }
-    
+
 #if TARGET_MACOS
     [instanceArgumentBuffer didModifyRange:NSMakeRange(0, instanceArgumentBuffer.length)];
 #endif
 
-    
     NSUInteger meshArgumentSize = meshEncoder.encodedLength * _meshes.count;
     id<MTLBuffer> meshArgumentBuffer = [self newBufferWithLabel:@"meshArgumentBuffer"
                                                          length:meshArgumentSize
-                                                        options:storageMode
-                                                      trackedIn:sceneResources];
+                                                        options:storageMode];
 
     // Encode the meshes array in `Scene` (`Scene::meshes`).
     for ( NSUInteger i = 0; i < _meshes.count; ++i )
@@ -559,16 +563,16 @@ typedef struct ThinGBuffer
                        atIndex:AAPLArgmentBufferIDMeshGenerics];
 
         NSAssert( metalKitMesh.vertexBuffers.count == 2, @"unknown number of buffers!" );
-        [sceneResources addObject:metalKitMesh.vertexBuffers[0].buffer];
-        [sceneResources addObject:metalKitMesh.vertexBuffers[1].buffer];
-        
+
+        [_sceneResources addObject:metalKitMesh.vertexBuffers[0].buffer];
+        [_sceneResources addObject:metalKitMesh.vertexBuffers[1].buffer];
+
         // Build submeshes into a buffer and reference it through a pointer in the mesh.
 
         NSUInteger submeshArgumentSize = submeshEncoder.encodedLength * mesh.submeshes.count;
         id<MTLBuffer> submeshArgumentBuffer = [self newBufferWithLabel:[NSString stringWithFormat:@"submeshArgumentBuffer %lu", (unsigned long)i]
                                                                 length:submeshArgumentSize
-                                                               options:storageMode
-                                                             trackedIn:sceneResources];
+                                                               options:storageMode];
 
         for ( NSUInteger j = 0; j < mesh.submeshes.count; ++j )
         {
@@ -577,12 +581,12 @@ typedef struct ThinGBuffer
                                        offset:(submeshEncoder.encodedLength * j)];
 
             // Set `Submesh::indices`.
-            MTKMeshBuffer* indexBuffer = submesh.metalKitSubmmesh.indexBuffer;
+            MTKMeshBuffer* indexBuffer = submesh.metalKitSubmesh.indexBuffer;
             uint32_t* pIndexType = [submeshEncoder constantDataAtIndex:0];
-            
+
             // Encode whether each index is 16-bit or 32-bit wide.
-            *pIndexType = submesh.metalKitSubmmesh.indexType == MTLIndexTypeUInt32 ? 0 : 1;
-            
+            *pIndexType = submesh.metalKitSubmesh.indexType == MTLIndexTypeUInt32 ? 0 : 1;
+
             [submeshEncoder setBuffer:indexBuffer.buffer
                                offset:indexBuffer.offset
                               atIndex:AAPLArgmentBufferIDSubmeshIndices];
@@ -592,9 +596,11 @@ typedef struct ThinGBuffer
                 [submeshEncoder setTexture:submesh.textures[m]
                                    atIndex:AAPLArgmentBufferIDSubmeshMaterials + m];
             }
-            [sceneResources addObject:submesh.metalKitSubmmesh.indexBuffer.buffer];
-            [sceneResources addObjectsFromArray:submesh.textures];
 
+            id<MTLBuffer> submeshIndexBuffer = submesh.metalKitSubmesh.indexBuffer.buffer;
+
+            [_sceneResources addObject:submeshIndexBuffer];
+            [_sceneResources addObjectsFromArray:submesh.textures];
         }
 
 #if TARGET_MACOS
@@ -609,32 +615,46 @@ typedef struct ThinGBuffer
 
     id<MTLBuffer> sceneArgumentBuffer = [self newBufferWithLabel:@"sceneArgumentBuffer"
                                                           length:sceneEncoder.encodedLength
-                                                         options:storageMode
-                                                       trackedIn:sceneResources];
+                                                         options:storageMode];
 
     [sceneEncoder setArgumentBuffer:sceneArgumentBuffer offset:0];
 
     // Set `Scene::instances`.
     [sceneEncoder setBuffer:instanceArgumentBuffer offset:0 atIndex:AAPLArgmentBufferIDSceneInstances];
-    
+
     // Set `Scene::meshes`.
     [sceneEncoder setBuffer:meshArgumentBuffer offset:0 atIndex:AAPLArgumentBufferIDSceneMeshes];
-
 
 #if TARGET_MACOS
     [meshArgumentBuffer didModifyRange:NSMakeRange(0, meshArgumentBuffer.length)];
     [sceneArgumentBuffer didModifyRange:NSMakeRange(0, sceneArgumentBuffer.length)];
 #endif
 
-    _sceneResources = sceneResources;
     _sceneArgumentBuffer = sceneArgumentBuffer;
 }
 
-- (id<MTLBuffer>)newBufferWithLabel:(NSString *)label length:(NSUInteger)length options:(MTLResourceOptions)options trackedIn:(nonnull NSMutableSet<id<MTLResource>> *)set
+#if AAPL_SUPPORTS_RESIDENCY_SETS
+- (id<MTLResidencySet>)newResidencySetWithLabel:(NSString *)label
+                                          error:(NSError * __nullable * __nullable)error
+NS_AVAILABLE(15, 18)
 {
-    id< MTLBuffer > buffer = [_device newBufferWithLength:length options:options];
+    MTLResidencySetDescriptor *residencySetDescriptor = [[MTLResidencySetDescriptor alloc] init];
+    residencySetDescriptor.label = label;
+
+    id<MTLResidencySet> residencySet = [_device newResidencySetWithDescriptor:residencySetDescriptor
+                                                                        error:error];
+
+    return residencySet;
+}
+#endif
+
+- (id<MTLBuffer>)newBufferWithLabel:(NSString *)label length:(NSUInteger)length options:(MTLResourceOptions)options
+{
+    id<MTLBuffer> buffer = [_device newBufferWithLength:length options:options];
     buffer.label = label;
-    [set addObject:buffer];
+
+    [_sceneResources addObject:buffer];
+
     return buffer;
 }
 
@@ -652,23 +672,19 @@ typedef struct ThinGBuffer
     // The renderer builds this structure to match the ray-traced scene structure so the
     // ray-tracing shader navigates it. In particular, Metal represents each submesh as a
     // geometry in the primitive acceleration structure.
-
-    NSMutableSet< id<MTLResource> >* sceneResources = [NSMutableSet new];
-
-    NSUInteger instanceArgumentSize = sizeof( struct Instance ) * kMaxInstances;
+    NSUInteger instanceArgumentSize = sizeof( struct Instance ) * kMaxModelInstances;
     id<MTLBuffer> instanceArgumentBuffer = [self newBufferWithLabel:@"instanceArgumentBuffer"
                                                              length:instanceArgumentSize
-                                                             options:storageMode
-                                                           trackedIn:sceneResources];
-    
+                                                             options:storageMode];
+
     // Encode the instances array in `Scene` (`Scene::instances`).
-    for ( NSUInteger i = 0; i < kMaxInstances; ++i )
+    for ( NSUInteger i = 0; i < kMaxModelInstances; ++i )
     {
         struct Instance* pInstance = ((struct Instance *)instanceArgumentBuffer.contents) + i;
         pInstance->meshIndex = _modelInstances[i].meshIndex;
         pInstance->transform = calculateTransform(_modelInstances[i]);
     }
-    
+
 #if TARGET_MACOS
     [instanceArgumentBuffer didModifyRange:NSMakeRange(0, instanceArgumentBuffer.length)];
 #endif
@@ -676,53 +692,54 @@ typedef struct ThinGBuffer
     NSUInteger meshArgumentSize = sizeof( struct Mesh ) * _meshes.count;
     id<MTLBuffer> meshArgumentBuffer = [self newBufferWithLabel:@"meshArgumentBuffer"
                                                          length:meshArgumentSize
-                                                        options:storageMode
-                                                      trackedIn:sceneResources];
-    
+                                                        options:storageMode];
+
     // Encode the meshes array in Scene (Scene::meshes).
     for ( NSUInteger i = 0; i < _meshes.count; ++i )
     {
         AAPLMesh* mesh = _meshes[i];
-        
+
         struct Mesh* pMesh = ((struct Mesh *)meshArgumentBuffer.contents) + i;
 
         MTKMesh* metalKitMesh = mesh.metalKitMesh;
 
         // Set `Mesh::positions`.
         pMesh->positions = metalKitMesh.vertexBuffers[0].buffer.gpuAddress + metalKitMesh.vertexBuffers[0].offset;
-        
+
         // Set `Mesh::generics`.
         pMesh->generics = metalKitMesh.vertexBuffers[1].buffer.gpuAddress + metalKitMesh.vertexBuffers[1].offset;
 
         NSAssert( metalKitMesh.vertexBuffers.count == 2, @"unknown number of buffers!" );
-        [sceneResources addObject:metalKitMesh.vertexBuffers[0].buffer];
-        [sceneResources addObject:metalKitMesh.vertexBuffers[1].buffer];
-        
+
+        [_sceneResources addObject:metalKitMesh.vertexBuffers[0].buffer];
+        [_sceneResources addObject:metalKitMesh.vertexBuffers[1].buffer];
+
         // Build submeshes into a buffer and reference it through a pointer in the mesh.
 
         NSUInteger submeshArgumentSize = sizeof( struct Submesh ) * mesh.submeshes.count;
         id<MTLBuffer> submeshArgumentBuffer = [self newBufferWithLabel:[NSString stringWithFormat:@"submeshArgumentBuffer %lu", (unsigned long)i]
                                                                 length:submeshArgumentSize
-                                                                options:storageMode
-                                                              trackedIn:sceneResources];
-        
+                                                                options:storageMode];
+
         for ( NSUInteger j = 0; j < mesh.submeshes.count; ++j )
         {
             AAPLSubmesh* submesh = mesh.submeshes[j];
             struct Submesh* pSubmesh = ((struct Submesh *)submeshArgumentBuffer.contents) + j;
 
             // Set `Submesh::indices`.
-            MTKMeshBuffer* indexBuffer = submesh.metalKitSubmmesh.indexBuffer;
-            pSubmesh->shortIndexType = submesh.metalKitSubmmesh.indexType == MTLIndexTypeUInt32 ? 0 : 1;
+            MTKMeshBuffer* indexBuffer = submesh.metalKitSubmesh.indexBuffer;
+            pSubmesh->shortIndexType = submesh.metalKitSubmesh.indexType == MTLIndexTypeUInt32 ? 0 : 1;
             pSubmesh->indices = indexBuffer.buffer.gpuAddress + indexBuffer.offset;
 
             for (NSUInteger m = 0; m < submesh.textures.count; ++m)
             {
                 pSubmesh->materials[m] = submesh.textures[m].gpuResourceID;
             }
-            [sceneResources addObject:submesh.metalKitSubmmesh.indexBuffer.buffer];
-            [sceneResources addObjectsFromArray:submesh.textures];
 
+            id<MTLBuffer> submeshIndexBuffer = submesh.metalKitSubmesh.indexBuffer.buffer;
+            [_sceneResources addObject:submeshIndexBuffer];
+
+            [_sceneResources addObjectsFromArray:submesh.textures];
         }
 
 #if TARGET_MACOS
@@ -733,29 +750,24 @@ typedef struct ThinGBuffer
         pMesh->submeshes = submeshArgumentBuffer.gpuAddress;
     }
 
-    [sceneResources addObject:meshArgumentBuffer];
-
+    [_sceneResources addObject:meshArgumentBuffer];
 
     id<MTLBuffer> sceneArgumentBuffer = [self newBufferWithLabel:@"sceneArgumentBuffer"
                                                           length:sizeof( struct Scene )
-                                                          options:storageMode
-                                                        trackedIn:sceneResources];
+                                                         options:storageMode];
 
     // Set `Scene::instances`.
     ((struct Scene *)sceneArgumentBuffer.contents)->instances = instanceArgumentBuffer.gpuAddress;
-    
+
     // Set `Scene::meshes`.
     ((struct Scene *)sceneArgumentBuffer.contents)->meshes = meshArgumentBuffer.gpuAddress;
-
 
 #if TARGET_MACOS
     [meshArgumentBuffer didModifyRange:NSMakeRange(0, meshArgumentBuffer.length)];
     [sceneArgumentBuffer didModifyRange:NSMakeRange(0, sceneArgumentBuffer.length)];
 #endif
 
-    _sceneResources = sceneResources;
     _sceneArgumentBuffer = sceneArgumentBuffer;
-    
     
 }
 
@@ -796,9 +808,9 @@ typedef struct ThinGBuffer
                                                                                      signalEvent:(id<MTLEvent>)event NS_AVAILABLE(13,16)
 {
     NSAssert( heap, @"Heap argument is required" );
-    
+
     NSMutableArray< id<MTLAccelerationStructure> >* accelStructures = [NSMutableArray arrayWithCapacity:descriptors.count];
-    
+
     id<MTLBuffer> scratch = [_device newBufferWithLength:maxScratchSize options:MTLResourceStorageModePrivate];
     id<MTLCommandBuffer> cmd = [_commandQueue commandBuffer];
     id<MTLAccelerationStructureCommandEncoder> enc = [cmd accelerationStructureCommandEncoder];
@@ -810,7 +822,7 @@ typedef struct ThinGBuffer
         [enc buildAccelerationStructure:accelStructure descriptor:descriptor scratchBuffer:scratch scratchBufferOffset:0];
         [accelStructures addObject:accelStructure];
     }
-    
+
     [enc endEncoding];
     [cmd encodeSignalEvent:event value:kPrimitiveAccelerationStructureBuild];
     [cmd commit];
@@ -829,6 +841,9 @@ typedef struct ThinGBuffer
     // 1 Primitive Acceleration Structure = 1 Mesh in _meshes
     // 1 Primitive Acceleration Structure -> n geometries == n submeshes
 
+    id<MTLHeap> accelerationStructureHeap;
+    NSArray< id<MTLAccelerationStructure> > *primitiveAccelerationStructures;
+
     NSMutableArray< MTLPrimitiveAccelerationStructureDescriptor* > *primitiveAccelerationDescriptors = [NSMutableArray arrayWithCapacity:_meshes.count];
     for ( AAPLMesh* mesh in _meshes )
     {
@@ -840,23 +855,23 @@ typedef struct ThinGBuffer
             g.vertexBufferOffset = mesh.metalKitMesh.vertexBuffers.firstObject.offset;
             g.vertexStride = 12; // The buffer must be packed XYZ XYZ XYZ ...
 
-            g.indexBuffer = submesh.metalKitSubmmesh.indexBuffer.buffer;
-            g.indexBufferOffset = submesh.metalKitSubmmesh.indexBuffer.offset;
-            g.indexType = submesh.metalKitSubmmesh.indexType;
+            g.indexBuffer = submesh.metalKitSubmesh.indexBuffer.buffer;
+            g.indexBufferOffset = submesh.metalKitSubmesh.indexBuffer.offset;
+            g.indexType = submesh.metalKitSubmesh.indexType;
 
             NSUInteger indexElementSize = (g.indexType == MTLIndexTypeUInt16) ? sizeof(uint16_t) : sizeof(uint32_t);
-            g.triangleCount = submesh.metalKitSubmmesh.indexBuffer.length / indexElementSize / 3;
+            g.triangleCount = submesh.metalKitSubmesh.indexBuffer.length / indexElementSize / 3;
             [geometries addObject:g];
         }
         MTLPrimitiveAccelerationStructureDescriptor* primDesc = [MTLPrimitiveAccelerationStructureDescriptor descriptor];
         primDesc.geometryDescriptors = geometries;
         [primitiveAccelerationDescriptors addObject:primDesc];
     }
-    
+
     // Allocate all primitive acceleration structures.
     // On Metal 3, allocate directly from a MTLHeap.
     BOOL heapBasedAllocation = NO;
-    
+
     char* opts = getenv("DISABLE_METAL3_FEATURES");
     if ( (opts == NULL) || (strstr(opts, "1") != opts) )
     {
@@ -868,40 +883,39 @@ typedef struct ThinGBuffer
                 MTLAccelerationStructureSizes storageSizes = [self calculateSizeForPrimitiveAccelerationStructures:primitiveAccelerationDescriptors];
                 MTLHeapDescriptor* heapDesc = [[MTLHeapDescriptor alloc] init];
                 heapDesc.size = storageSizes.accelerationStructureSize;
-                _accelerationStructureHeap = [_device newHeapWithDescriptor:heapDesc];
-                _primitiveAccelerationStructures = [self allocateAndBuildAccelerationStructuresWithDescriptors:primitiveAccelerationDescriptors
-                                                                                                          heap:_accelerationStructureHeap
-                                                                                          maxScratchBufferSize:storageSizes.buildScratchBufferSize
-                                                                                                   signalEvent:_accelerationStructureBuildEvent];
+                accelerationStructureHeap = [_device newHeapWithDescriptor:heapDesc];
+                primitiveAccelerationStructures = [self allocateAndBuildAccelerationStructuresWithDescriptors:primitiveAccelerationDescriptors
+                                                                                                         heap:accelerationStructureHeap
+                                                                                         maxScratchBufferSize:storageSizes.buildScratchBufferSize
+                                                                                                  signalEvent:_accelerationStructureBuildEvent];
             }
         }
     }
-    
+
     // Non-Metal 3 devices, allocate each acceleration structure individually.
     if ( !heapBasedAllocation )
     {
-        NSMutableArray< id<MTLAccelerationStructure> >* primitiveAccelerationStructures = [NSMutableArray arrayWithCapacity:_meshes.count];
+        NSMutableArray< id<MTLAccelerationStructure> >* mutablePrimitiveAccelerationStructures = [NSMutableArray arrayWithCapacity:_meshes.count];
         id< MTLCommandBuffer > cmd = [_commandQueue commandBuffer];
         for ( MTLPrimitiveAccelerationStructureDescriptor* desc in primitiveAccelerationDescriptors )
         {
-            [primitiveAccelerationStructures addObject:[self allocateAndBuildAccelerationStructureWithDescriptor:desc commandBuffer:(id<MTLCommandBuffer>)cmd]];
+            [mutablePrimitiveAccelerationStructures addObject:[self allocateAndBuildAccelerationStructureWithDescriptor:desc commandBuffer:(id<MTLCommandBuffer>)cmd]];
         }
         [cmd encodeSignalEvent:_accelerationStructureBuildEvent value:kPrimitiveAccelerationStructureBuild];
         [cmd commit];
-        _primitiveAccelerationStructures = primitiveAccelerationStructures;
+        primitiveAccelerationStructures = mutablePrimitiveAccelerationStructures;
     }
-    
 
     MTLInstanceAccelerationStructureDescriptor* instanceAccelStructureDesc = [MTLInstanceAccelerationStructureDescriptor descriptor];
-    instanceAccelStructureDesc.instancedAccelerationStructures = _primitiveAccelerationStructures;
+    instanceAccelStructureDesc.instancedAccelerationStructures = primitiveAccelerationStructures;
 
-    instanceAccelStructureDesc.instanceCount = kMaxInstances;
+    instanceAccelStructureDesc.instanceCount = kMaxModelInstances;
 
     // Load instance data (two fire trucks + one sphere + floor):
 
-    id<MTLBuffer> instanceDescriptorBuffer = [_device newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor) * kMaxInstances options:MTLResourceStorageModeShared];
+    id<MTLBuffer> instanceDescriptorBuffer = [_device newBufferWithLength:sizeof(MTLAccelerationStructureInstanceDescriptor) * kMaxModelInstances options:MTLResourceStorageModeShared];
     MTLAccelerationStructureInstanceDescriptor* instanceDescriptors = (MTLAccelerationStructureInstanceDescriptor *)instanceDescriptorBuffer.contents;
-    for (NSUInteger i = 0; i < kMaxInstances; ++i)
+    for (NSUInteger i = 0; i < kMaxModelInstances; ++i)
     {
         instanceDescriptors[i].accelerationStructureIndex = _modelInstances[i].meshIndex;
         instanceDescriptors[i].intersectionFunctionTableOffset = 0;
@@ -918,14 +932,58 @@ typedef struct ThinGBuffer
     _instanceAccelerationStructure = [self allocateAndBuildAccelerationStructureWithDescriptor:instanceAccelStructureDesc commandBuffer:cmd];
     [cmd encodeSignalEvent:_accelerationStructureBuildEvent value:kInstanceAccelerationStructureBuild];
     [cmd commit];
+
+    if (heapBasedAllocation)
+    {
+        [_sceneHeaps addObject:accelerationStructureHeap];
+    }
+    else
+    {
+        [_sceneResources addObjectsFromArray:primitiveAccelerationStructures];
+    }
 }
+
+#pragma mark - Residency
+
+#if AAPL_SUPPORTS_RESIDENCY_SETS
+- (void)buildSceneResidencySet NS_AVAILABLE(15, 18)
+{
+    NSError *error = nil;
+
+    id<MTLResidencySet> sceneResidencySet = [self newResidencySetWithLabel:@"sceneResidencySet"
+                                                                     error:&error];
+
+    NSAssert(sceneResidencySet, @"The app can't create an `MTLResidencySet`! Details: %@", error ? error.localizedDescription : @"The device doesn't support `MTLResidencySet`");
+
+    void (^addAllocationsBlock)(__unsafe_unretained id *, NSUInteger) = ^(__unsafe_unretained id *data, NSUInteger count)
+    {
+        [sceneResidencySet addAllocations:data
+                                    count:count];
+    };
+
+    arrayToBatchMethodHelper(_sceneResources, addAllocationsBlock);
+    arrayToBatchMethodHelper(_sceneHeaps, addAllocationsBlock);
+
+    // Finalize all allocations in the residency set by calling commit.
+    [sceneResidencySet commit];
+
+    // Request residency to attempt to make the contents of the residency set resident at this point.
+    [sceneResidencySet requestResidency];
+
+    // Adding the residency set to the command queue lets Metal know that the contents of the residency set
+    // have to be resident before any future command buffers submitted to the queue execute.
+    [_commandQueue addResidencySet:sceneResidencySet];
+
+    _sceneResidencySet = sceneResidencySet;
+}
+#endif
 
 #pragma mark - Update State
 
 matrix_float4x4 calculateTransform( ModelInstance instance )
 {
     vector_float3 rotationAxis = {0, 1, 0};
-    matrix_float4x4 rotationMatrix = matrix4x4_rotation( instance.rotationRad, rotationAxis );
+    matrix_float4x4 rotationMatrix = matrix4x4_rotation( instance.rotation, rotationAxis );
     matrix_float4x4 translationMatrix = matrix4x4_translation( instance.position );
 
     return matrix_multiply(translationMatrix, rotationMatrix);
@@ -933,7 +991,7 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
 
 - (void)setStaticState
 {
-    for (NSUInteger i = 0; i < kMaxInstances; ++i)
+    for (NSUInteger i = 0; i < kMaxModelInstances; ++i)
     {
         AAPLInstanceTransform* transforms = (AAPLInstanceTransform *)(((uint8_t *)_instanceTransformBuffer.contents) + (i * kAlignedInstanceTransformsStructSize));
         transforms->modelViewMatrix = calculateTransform( _modelInstances[i] );
@@ -975,14 +1033,29 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
 
 - (void)encodeSceneRendering:(id<MTLRenderCommandEncoder >)renderEncoder
 {
-    // Flag the residency of indirect resources in the scene.
-    for ( id<MTLResource> res in _sceneResources)
+#if AAPL_SUPPORTS_RESIDENCY_SETS
+    if (!_useResidencySet)
+#endif
     {
-        [renderEncoder useResource:res usage:MTLResourceUsageRead stages:MTLRenderStageFragment];
+        // Flag residency for indirectly referenced heaps to make the driver put them into GPU memory.
+        arrayToBatchMethodHelper(_sceneHeaps, ^(__unsafe_unretained id *data, NSUInteger count)
+        {
+            [renderEncoder useHeaps:data
+                              count:count
+                             stages:MTLRenderStageFragment];
+        });
+
+        // Flag residency for indirectly referenced resources to make the driver put them into GPU memory.
+        arrayToBatchMethodHelper(_sceneResources, ^(__unsafe_unretained id *data, NSUInteger count)
+        {
+            [renderEncoder useResources:data
+                                  count:count
+                                  usage:MTLResourceUsageRead
+                                 stages:MTLRenderStageFragment];
+        });
     }
-    
-    //for (AAPLMesh *mesh in _meshes)
-    for ( NSUInteger i = 0; i < kMaxInstances; ++i )
+
+    for ( NSUInteger i = 0; i < kMaxModelInstances; ++i )
     {
         AAPLMesh* mesh = _meshes[ _modelInstances[ i ].meshIndex ];
         MTKMesh *metalKitMesh = mesh.metalKitMesh;
@@ -991,7 +1064,7 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
         for (NSUInteger bufferIndex = 0; bufferIndex < metalKitMesh.vertexBuffers.count; bufferIndex++)
         {
             MTKMeshBuffer *vertexBuffer = metalKitMesh.vertexBuffers[bufferIndex];
-            if((NSNull *)vertexBuffer != [NSNull null])
+            if ((NSNull *)vertexBuffer != [NSNull null])
             {
                 [renderEncoder setVertexBuffer:vertexBuffer.buffer
                                         offset:vertexBuffer.offset
@@ -1003,7 +1076,7 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
         for ( NSUInteger submeshIndex = 0; submeshIndex < mesh.submeshes.count; ++submeshIndex )
         {
             AAPLSubmesh* submesh = mesh.submeshes[ submeshIndex ];
-            
+
             // Access textures directly from the argument buffer and avoid rebinding them individually.
             // `SubmeshKeypath` provides the path to the argument buffer containing the texture data
             // for this submesh. The shader navigates the scene argument buffer using this key
@@ -1012,27 +1085,26 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
                 .instanceID = (uint32_t)i,
                 .submeshID = (uint32_t)submeshIndex
             };
-            
-            MTKSubmesh *metalKitSubmesh = submesh.metalKitSubmmesh;
-            
+
+            MTKSubmesh *metalKitSubmesh = submesh.metalKitSubmesh;
+
             [renderEncoder setVertexBuffer:_instanceTransformBuffer
                                     offset:kAlignedInstanceTransformsStructSize * i
                                    atIndex:BufferIndexInstanceTransforms];
-            
+
             [renderEncoder setVertexBuffer:_cameraDataBuffers[_cameraBufferIndex] offset:0 atIndex:BufferIndexCameraData];
             [renderEncoder setFragmentBuffer:_cameraDataBuffers[_cameraBufferIndex] offset:0 atIndex:BufferIndexCameraData];
             [renderEncoder setFragmentBuffer:_lightDataBuffer offset:0 atIndex:BufferIndexLightData];
-            
+
             // Bind the scene and provide the keypath to retrieve this submesh's data.
             [renderEncoder setFragmentBuffer:_sceneArgumentBuffer offset:0 atIndex:SceneIndex];
             [renderEncoder setFragmentBytes:&submeshKeypath length:sizeof(AAPLSubmeshKeypath) atIndex:BufferIndexSubmeshKeypath];
-            
+
             [renderEncoder drawIndexedPrimitives:metalKitSubmesh.primitiveType
                                       indexCount:metalKitSubmesh.indexCount
                                        indexType:metalKitSubmesh.indexType
                                      indexBuffer:metalKitSubmesh.indexBuffer.buffer
                                indexBufferOffset:metalKitSubmesh.indexBuffer.offset];
-
         }
 
     }
@@ -1059,56 +1131,55 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
     tmpDesc.mipmapLevelCount = 1;
     tmpDesc.usage = MTLResourceUsageRead | MTLResourceUsageWrite;
     tmpDesc.resourceOptions = MTLResourceStorageModePrivate;
-    
+
     id< MTLTexture > src = _rtReflectionMap;
-    
+
     uint32_t newW = (uint32_t)_rtReflectionMap.width;
     uint32_t newH = (uint32_t)_rtReflectionMap.height;
-    
+
     id< MTLEvent > event = [_device newEvent];
     uint64_t count = 0u;
     [commandBuffer encodeSignalEvent:event value:count];
-    
+
     while ( count+1 < _rtReflectionMap.mipmapLevelCount )
     {
         [commandBuffer pushDebugGroup:[NSString stringWithFormat:@"Mip level: %llu", count]];
-        
+
         tmpDesc.width = newW;
         tmpDesc.height = newH;
-        
+
         id< MTLTexture > dst = [_rtMipmappingHeap newTextureWithDescriptor:tmpDesc];
-        
-        
+
         [gauss encodeToCommandBuffer:commandBuffer
                        sourceTexture:src
                   destinationTexture:dst];
-        
+
         ++count;
         [commandBuffer encodeSignalEvent:event value:count];
-        
+
         [commandBuffer encodeWaitForEvent:event value:count];
         id<MTLTexture> targetMip = [_rtReflectionMap newTextureViewWithPixelFormat:MTLPixelFormatRG11B10Float
                                                                        textureType:MTLTextureType2D
                                                                             levels:NSMakeRange(count, 1)
                                                                             slices:NSMakeRange(0, 1)];
-        
+
         MTLRenderPassDescriptor* rpd = [[MTLRenderPassDescriptor alloc] init];
         rpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
         rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
         rpd.colorAttachments[0].texture = targetMip;
-        
+
         id< MTLRenderCommandEncoder > blit = [commandBuffer renderCommandEncoderWithDescriptor:rpd];
         [blit setCullMode:MTLCullModeNone];
         [blit setRenderPipelineState:_rtMipmapPipeline];
         [blit setFragmentTexture:dst atIndex:0];
         [blit drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
         [blit endEncoding];
-        
+
         src = targetMip;
-        
+
         newW = newW / 2;
         newH = newH / 2;
-        
+
         [commandBuffer popDebugGroup];
     }
 }
@@ -1130,11 +1201,11 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
 
     [self updateCameraState];
 
-    /// Delay getting the currentRenderPassDescriptor until the renderer absolutely needs it to avoid
-    ///   holding onto the drawable and blocking the display pipeline any longer than necessary.
+    // Delay getting the currentRenderPassDescriptor until the renderer absolutely needs it to avoid
+    // holding onto the drawable and blocking the display pipeline any longer than necessary.
     MTLRenderPassDescriptor* renderPassDescriptor = view.currentRenderPassDescriptor;
 
-    if(renderPassDescriptor != nil)
+    if (renderPassDescriptor != nil)
     {
 
         // When ray tracing is in an enabled state, first render a thin G-Buffer
@@ -1143,7 +1214,6 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
 
         if ( _renderMode == RMMetalRaytracing || _renderMode == RMReflectionsOnly )
         {
-
             MTLRenderPassDescriptor* gbufferPass = [MTLRenderPassDescriptor new];
             gbufferPass.colorAttachments[0].loadAction = MTLLoadActionClear;
             gbufferPass.colorAttachments[0].clearColor = MTLClearColorMake(0, 0, 0, 1);
@@ -1200,30 +1270,26 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
             // Set the ray tracing reflection kernel.
             [compEnc setComputePipelineState:_rtReflectionPipeline];
 
-            // Flag residency for indirectly referenced resources.
-            // These are:
-            // 1. All primitive acceleration structures.
-            // 2. Buffers and textures referenced through argument buffers.
-
-            if ( _accelerationStructureHeap )
+#if AAPL_SUPPORTS_RESIDENCY_SETS
+            if (!_useResidencySet)
+#endif
             {
-                // Heap backs the acceleration structures. Mark the entire heap resident.
-                [compEnc useHeap:_accelerationStructureHeap];
-            }
-            else
-            {
-                // Acceleration structures are independent. Mark each one resident.
-                for ( id<MTLAccelerationStructure> primAccelStructure in _primitiveAccelerationStructures )
+                // Flag residency for indirectly referenced heaps to make the driver put them into GPU memory.
+                arrayToBatchMethodHelper(_sceneHeaps, ^(__unsafe_unretained id *data, NSUInteger count)
                 {
-                    [compEnc useResource:primAccelStructure usage:MTLResourceUsageRead];
-                }
+                    [compEnc useHeaps:data
+                                count:count];
+                });
+
+                // Flag residency for indirectly referenced resources to make the driver put them into GPU memory.
+                arrayToBatchMethodHelper(_sceneResources, ^(__unsafe_unretained id *data, NSUInteger count)
+                {
+                    [compEnc useResources:data
+                                    count:count
+                                    usage:MTLResourceUsageRead];
+                });
             }
 
-            for ( id<MTLResource> resource in _sceneResources )
-            {
-                [compEnc useResource:resource usage:MTLResourceUsageRead];
-            }
-            
             // Determine the dispatch grid size and dispatch compute.
 
             NSUInteger w = _rtReflectionPipeline.threadExecutionWidth;
@@ -1256,13 +1322,12 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
             [commandBuffer popDebugGroup];
         }
 
-        
         // Encode the forward pass.
 
         MTLRenderPassDescriptor* rpd = view.currentRenderPassDescriptor;
         id<MTLTexture> drawableTexture = rpd.colorAttachments[0].texture;
         rpd.colorAttachments[0].texture = _rawColorMap;
-        
+
         [commandBuffer pushDebugGroup:@"Forward Scene Render"];
         id<MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:rpd];
         renderEncoder.label = @"ForwardPassRenderEncoder";
@@ -1292,18 +1357,18 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
 
         [renderEncoder setCullMode:MTLCullModeBack];
         [renderEncoder setRenderPipelineState:_skyboxPipelineState];
-        
+
         [renderEncoder setVertexBuffer:_cameraDataBuffers[_cameraBufferIndex]
                                 offset:0
                                atIndex:BufferIndexCameraData];
-        
+
         [renderEncoder setFragmentTexture:_skyMap atIndex:0];
-        
+
         MTKMesh* metalKitMesh = _skybox.metalKitMesh;
         for (NSUInteger bufferIndex = 0; bufferIndex < metalKitMesh.vertexBuffers.count; bufferIndex++)
         {
             MTKMeshBuffer *vertexBuffer = metalKitMesh.vertexBuffers[bufferIndex];
-            if((NSNull *)vertexBuffer != [NSNull null])
+            if ((NSNull *)vertexBuffer != [NSNull null])
             {
                 [renderEncoder setVertexBuffer:vertexBuffer.buffer
                                         offset:vertexBuffer.offset
@@ -1311,7 +1376,7 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
             }
         }
 
-        for(MTKSubmesh *submesh in metalKitMesh.submeshes)
+        for (MTKSubmesh *submesh in metalKitMesh.submeshes)
         {
             [renderEncoder drawIndexedPrimitives:submesh.primitiveType
                                       indexCount:submesh.indexCount
@@ -1322,8 +1387,7 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
 
         [renderEncoder endEncoding];
         [commandBuffer popDebugGroup];
-        
-        
+
         // Clamp values to the bloom threshold.
         {
             [commandBuffer pushDebugGroup:@"Bloom Threshold"];
@@ -1331,12 +1395,12 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
             rpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
             rpd.colorAttachments[0].texture = _bloomThresholdMap;
-            
+
             id<MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:rpd];
             [renderEncoder pushDebugGroup:@"Postprocessing"];
             [renderEncoder setRenderPipelineState:_bloomThresholdPipeline];
             [renderEncoder setFragmentTexture:_rawColorMap atIndex:0];
-            
+
             float threshold = 2.0f;
             [renderEncoder setFragmentBytes:&threshold length:sizeof(float) atIndex:0];
             [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:6];
@@ -1344,7 +1408,7 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
             [renderEncoder endEncoding];
             [commandBuffer popDebugGroup];
         }
-        
+
         // Blur the bloom.
         {
             [commandBuffer pushDebugGroup:@"Bloom Blur"];
@@ -1354,7 +1418,7 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
                      destinationTexture:_bloomBlurMap];
             [commandBuffer popDebugGroup];
         }
-        
+
         // Merge the postprocessing results with the scene rendering.
         {
             [commandBuffer pushDebugGroup:@"Final Merge"];
@@ -1362,7 +1426,7 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
             rpd.colorAttachments[0].loadAction = MTLLoadActionDontCare;
             rpd.colorAttachments[0].storeAction = MTLStoreActionStore;
             rpd.colorAttachments[0].texture = drawableTexture;
-            
+
             id<MTLRenderCommandEncoder> renderEncoder = [commandBuffer renderCommandEncoderWithDescriptor:rpd];
             [renderEncoder pushDebugGroup:@"Postprocessing Merge"];
             [renderEncoder setRenderPipelineState:_postMergePipeline];
@@ -1372,12 +1436,12 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
             [renderEncoder drawPrimitives:MTLPrimitiveTypeTriangle
                               vertexStart:0
                               vertexCount:6];
-            
+
             [renderEncoder popDebugGroup];
             [renderEncoder endEncoding];
             [commandBuffer popDebugGroup];
         }
-        
+
         [commandBuffer presentDrawable:view.currentDrawable];
     }
 
@@ -1394,7 +1458,6 @@ matrix_float4x4 calculateTransform( ModelInstance instance )
 /// Respond to drawable size or orientation changes.
 - (void)mtkView:(nonnull MTKView *)view drawableSizeWillChange:(CGSize)size
 {
-
     float aspect = size.width / (float)size.height;
     _projectionMatrix = [self projectionMatrixWithAspect:aspect];
 

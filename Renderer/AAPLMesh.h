@@ -16,10 +16,10 @@ The header for mesh and submesh objects to use for managing models.
 
 // A MetalKit submesh that contains the primitive type, index buffer, and index count
 // for drawing all or part of its parent AAPLMesh object.
-@property (nonatomic, readonly, nonnull) MTKSubmesh *metalKitSubmmesh;
+@property (nonatomic, readonly, nonnull) MTKSubmesh *metalKitSubmesh;
 
 // Material textures (indexed by AAPLTextureIndex) to set in the Metal render command encoder
-// before drawing the submesh.  The renderer uses these for higher LODs.
+// before drawing the submesh. The renderer uses these for higher LODs.
 @property (nonatomic, readonly, nonnull) NSArray<id<MTLTexture>> *textures;
 
 @end
@@ -51,6 +51,5 @@ The header for mesh and submesh objects to use for managing models.
 @property (nonatomic, nonnull) NSArray<AAPLSubmesh*> *submeshes;
 
 @end
-
 
 __nullable id<MTLTexture> texture_from_radiance_file(NSString * __nonnull fileName, __nonnull id<MTLDevice> device, NSError * __nullable * __nullable error);

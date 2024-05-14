@@ -9,7 +9,6 @@ The header that contains the defining types to use in argument buffers.
 
 #include "AAPLShaderTypes.h"
 
-
 typedef enum AAPLArgumentBufferID
 {
     AAPLArgmentBufferIDGenericsTexcoord,

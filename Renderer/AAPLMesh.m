@@ -121,7 +121,7 @@ The implementation for the mesh and submesh objects.
     self = [super init];
     if(self)
     {
-        _metalKitSubmmesh = metalKitSubmesh;
+        _metalKitSubmesh = metalKitSubmesh;
 
         _textures = [[NSMutableArray alloc] initWithCapacity:AAPLMaterialTextureCount];
 
@@ -589,7 +589,6 @@ static CGImageRef createCGImageFromFile (NSString* path)
 
     return myImage;
 }
-
 
 id<MTLTexture> texture_from_radiance_file(NSString * fileName, id<MTLDevice> device, NSError ** error)
 {
